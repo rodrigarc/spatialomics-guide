@@ -1,0 +1,293 @@
+---
+title: "03_cell_type_deconvolution"
+format: html
+---
+
+## Setup output folders
+
+```{r}
+#| label: setup-folders
+#| include: false
+
+# Automatically get today's date
+today_date <- format(Sys.Date(), "%Y-%m-%d")
+
+# Create directory path
+output_dir <- file.path("results", "03_cell_type_deconvolution_outputs", today_date)
+
+# Create folder if it doesn't exist
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Show where output files will go
+output_dir
+```
+
+# Load packages
+
+```{r}
+#| label: load-packages
+#| include: false
+#| warning: false
+#| message: false
+#| error: false
+
+
+library(Seurat)
+library(spacexr)
+library(dplyr)
+library(ggplot2)
+library(RColorBrewer)
+library(SingleCellExperiment)
+library(HDF5Array)
+library(scRNAseq)
+
+
+```
+
+# Load Data
+
+Load data preprocessed, clustered using Banksy + Leiden, and manually annotated clusters based on DEGs. The annotation as seen before was not great since it some clusters probably have a mix of cell types. Thus, using a scRNA-seq dataset to help deconvolution of cells could be beneficial, specially for well characterize immune cells. 
+
+```{r}
+object <- readRDS(file ="results/02_normalization_and_clustering_outputs/2025-07-29/Banksy_manually_annotated_object.rds")
+
+```
+
+# Search and load reference dataset
+
+Fetch a scRNA-seq from blood and or lymph nodes to help the deconvolution of immune cells. The dataset used is the `He et al. 2020` dataset deposited at the `scRNAseq`, which contains cells from multiple human organs.
+
+```{r}
+#| eval: false
+
+searchDatasets(
+  defineTextQuery("blood", partial = TRUE) |
+  defineTextQuery("immune", partial = TRUE) |
+  defineTextQuery("pbmc", partial = TRUE)
+)[, c("name", "title", "description")]
+
+searchDatasets(
+  defineTextQuery("organs", partial = TRUE)
+)
+
+sce_lymphnode <- fetchDataset("he-organs-2020", version = "2023-12-21", path = "lymph_node")
+sce_blood <- fetchDataset("he-organs-2020", version = "2023-12-21", path = "blood")
+
+HDF5Array::saveHDF5SummarizedExperiment(sce_lymphnode, dir = "data/reference_dataset/he_2020_lymphnode", prefix = "he_2020_sce_lymphnode_", replace = TRUE)
+HDF5Array::saveHDF5SummarizedExperiment(sce_blood, dir = "data/reference_dataset/he_2020_blood", prefix = "he_2020_sce_blood_", replace = TRUE)
+```
+
+```{r}
+sce_lymphnode
+sce_blood
+
+common_genes <- intersect(rownames(sce_lymphnode), rownames(sce_blood))
+sce_lymphnode <- sce_lymphnode[common_genes, ]
+sce_blood <- sce_blood[common_genes, ]
+colnames(sce_lymphnode) <- paste0("LN_", colnames(sce_lymphnode))
+colnames(sce_blood) <- paste0("Blood_", colnames(sce_blood))
+sce_ref <- cbind(sce_lymphnode, sce_blood)
+```
+
+
+# Test deconvolution
+
+Use Robust Cell Type Decomposition (RCTD) method from `spacexr` R package to deconvolute the cell types in the spatial transcriptomics dataset using the reference dataset.
+
+```{r}
+#| eval: false
+# Prepare cluster and filter valid cells
+counts <- assay(sce_ref, "counts")
+cluster <- colData(sce_ref)$reclustered.fine
+cluster <- gsub("ly_|/", "", cluster)
+cluster <- sub("_[^_]+$", "", cluster)
+cluster[cluster %in% c("cDC1", "Mac", "Non_Classicial_Mon")] <- "Myeloid"
+cluster[cluster %in% c("MAIT", "TEM", "TEFF", "Th1")] <- "T_effector"
+cluster <- factor(cluster)
+names(cluster) <- colnames(sce_ref)
+valid <- !is.na(cluster)
+cluster <- droplevels(cluster[valid])
+counts <- counts[, valid]
+nUMI <- colSums(counts)
+
+# Create RCTD reference and query objects
+reference <- Reference(counts, cluster, nUMI)
+counts_spatial <- Seurat::GetAssayData(object, assay = "Spatial", slot = "counts")
+coords <- GetTissueCoordinates(object)[colnames(counts_spatial), c("x", "y")]
+query <- SpatialRNA(coords, counts_spatial, colSums(counts_spatial))
+
+# Run RCTD
+my_rctd <- create.RCTD(query, reference, max_cores = 7)
+my_rctd <- run.RCTD(my_rctd, doublet_mode = "doublet")
+
+saveRDS(my_rctd, file = file.path(output_dir, "rctd_deconvolution_object.rds"))
+```
+
+
+```{r}
+my_rctd <- readRDS(file = "results/03_cell_type_deconvolution_outputs/2025-07-29/rctd_deconvolution_object.rds")
+object <- AddMetaData(object, metadata = my_rctd@results$results_df)
+colnames(object@meta.data)
+```
+
+
+# Visualize deconvolution results
+
+## UMAP
+
+```{r}
+DefaultAssay(object) <- "Spatial"
+Idents(object) <- "first_type"
+Reductions(object)
+
+cols <- c(RColorBrewer::brewer.pal(12, "Paired"), "grey")
+
+p1 <- DimPlot(object, reduction = "umap.banksy", group.by = "first_type", label = TRUE) +
+  theme_void() +
+  theme(aspect.ratio = 1) +
+  scale_color_manual(values = cols)
+p1
+
+ggsave(p1, filename = file.path(output_dir, "umap_deconvoluted_first_type.pdf"), width = 5, height = 5)
+
+Idents(object) <- "second_type"
+cols <- c(RColorBrewer::brewer.pal(12, "Paired"), "grey")
+
+p1 <- DimPlot(object, reduction = "umap.banksy", group.by = "second_type", label = TRUE) +
+  theme_void() +
+  theme(aspect.ratio = 1) +
+  scale_color_manual(values = cols)
+p1
+
+ggsave(p1, filename = file.path(output_dir, "umap_deconvoluted_second_type.pdf"), width = 5, height = 5)
+```
+
+## Spatial plot
+
+```{r}
+DefaultAssay(object) <- "Spatial"
+p1 <- SpatialDimPlot(object, group.by = "first_type") +
+  theme_void() +
+  scale_fill_manual(values = cols)
+p1
+
+ggsave(p1, filename = file.path(output_dir, "spatial_deconvoluted_first_type.pdf"), width = 5, height = 5)
+```
+## Compare Banksy clusters with deconvoluted cell types
+
+
+```{r}
+plot_cell_types <- function(data, label, fill = "first_type") {
+  p <- ggplot(data, aes(x = get(label), y = n, fill = get(fill))) +
+    geom_bar(stat = "identity", position = "stack") +
+    geom_text(aes(label = ifelse(n >= min_count_to_show_label, get(fill), "")), position = position_stack(vjust = 0.5), size = 2) +
+    xlab(label) +
+    ylab("# of Spots") +
+    ggtitle(paste0("Distribution of Cell Types across ", label)) +
+    scale_fill_manual(values = cols) +
+    theme_bw() 
+}
+
+cell_type_banksy_counts <- object[[]] %>%
+  dplyr::filter(spot_class != "reject") %>%
+  dplyr::count(first_type, banksy_cluster)
+
+min_count_to_show_label <- 20
+
+p <- plot_cell_types(cell_type_banksy_counts, "banksy_cluster")
+p
+
+
+```
+
+```{r}
+
+# Filter high confidence spots
+table(object@meta.data$first_type)
+table(object@meta.data$spot_class)
+
+object$first_type_filtered <- ifelse(
+  object$spot_class == "reject",
+  NA,
+  as.character(object$first_type)
+)
+Idents(object) <- "first_type_filtered"
+
+cols2 <- c(cols, "grey80")
+
+p1 <- SpatialDimPlot(object, group.by = "first_type_filtered") +
+  theme_void() +
+  scale_fill_manual(values = cols2) 
+
+
+p1
+
+ggsave(p1, filename = file.path(output_dir, "spatial_deconvoluted_first_type_filtered.pdf"), width = 5, height = 5)
+```
+
+Interestingly, the rejected spots that according to `Banksy` package should normally be removed from analysis accounts for approximately half of the spots.
+
+
+
+## Merged annotation
+
+We know that some banksy clusters are not well annotated, so we can merge the deconvoluted cell types with the banksy clusters to have a better annotation of the spots. For example, fibroblasts and non-immune cells are not annotated in the scRNA-seq but it seems some clusters in bansky are mainly fibroblasts.
+
+```{r}
+# check rejected spots and add the nomenclature of the celltype manually annotated 
+# this can be useful for non-immune cells that are not present in the scRNA-seq dataset
+
+non_immune <- c("Blood vascular EC", "Lymphatic EC", "FRC", "Pericyte / SMC", "T-zone reticular")
+
+object$merged_annotation <- ifelse(
+  object$spot_class == "reject" | is.na(object$spot_class),
+  ifelse(object$celltype %in% non_immune, as.character(object$celltype), "Unknown"),
+  as.character(object$first_type)
+)
+
+Idents(object) <- "merged_annotation"
+
+cols2 <- c(cols, "grey80")
+p1 <- DimPlot(object, reduction = "umap.banksy",group.by = "merged_annotation", label = TRUE) +
+  theme_void() 
+p1
+
+ggsave(p1, filename = file.path(output_dir, "umap_banksy_merged_annotation.pdf"), width = 10, height = 10)
+
+p1 <- FeaturePlot(object, features = c("IGKC","IGHG1", "IGHM", "FOXP3", "IGLC3", "CD38", "AICDA", "CD3D", "CXCR5","S100A8", "C1QC","JCHAIN", "LILRA4","CD1C", "CCL19", "VWF", "PROX1","ACTA2", "MYH11"), reduction = "umap.banksy", keep.scale = "all") & NoAxes() & NoLegend()
+  
+p1
+
+ggsave(p1, filename = file.path(output_dir, "umap_banksy_feature_plot.pdf"), width = 10, height = 10)
+
+p1 <- SpatialDimPlot(object, group.by = "merged_annotation") +
+  theme_void() 
+p1
+
+
+cell_type_banksy_counts <- object[[]] %>%
+  dplyr::filter(spot_class != "reject") %>%
+  dplyr::count(first_type, banksy_cluster, merged_annotation)
+
+min_count_to_show_label <- 20
+
+p <- plot_cell_types(cell_type_banksy_counts, "banksy_cluster", fill ="merged_annotation")
+p
+
+ggsave(p, filename = file.path(output_dir, "cell_type_banksy_counts.pdf"), width = 10, height = 5)
+```
+
+# SaveRDS
+
+```{r}
+saveRDS(object, file = file.path(output_dir, "Banksy_merged_annotation.rds"))
+```
+
+
+# SessionInfo
+
+```{r}
+sessionInfo()
+```
