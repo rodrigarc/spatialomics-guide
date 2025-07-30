@@ -1,5 +1,256 @@
 ---
 title: "01_spatial_QC"
 format: html
+execute:
+  echo: true
+  warning: false
+  message: false
 ---
 
+## Setup output folders
+
+```{r}
+#| label: setup-folders
+#| include: false
+
+# Automatically get today's date
+today_date <- format(Sys.Date(), "%Y-%m-%d")
+
+# Create directory path
+output_dir <- file.path("results", "01_qc_outputs", today_date)
+
+# Create folder if it doesn't exist
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Show where output files will go
+output_dir
+```
+
+# Load packages
+
+```{r}
+#| label: load-packages
+
+library(arrow)
+library(Seurat)
+library(tidyverse)
+library(hdf5r)
+library(purrr)
+
+```
+
+# Load dataset
+
+Dataset used here is available at [10x Genomics website](https://www.10xgenomics.com/datasets/visium-hd-cytassist-gene-expression-libraries-human-lymph-node-v4). In summary, it is a formalin-fixed paraffin-embedded (FFPE) prelaryngeal lymph node tissue block from a human female donor. 
+
+A 5 µm tissue section was cut using an Epredia HM355S microtome and processed following the Visium HD FFPE Tissue Preparation Handbook (CG000684), including deparaffinization, hematoxylin and eosin (H&E) staining, and imaging. Imaging was performed using an Olympus VS200 Slide Scanner with a 20X objective (NA 0.8), a VS200 LED light source, an integrated iDS VS-264C camera, and an exposure time of 500 microseconds. 
+
+The spatial gene expression assay followed the Visium HD Spatial Gene Expression Reagent Kits User Guide (CG000685), including probe hybridization, ligation, slide preparation, probe release, extension, and library construction. The slide used had serial number H1-PFM4VVG and capture area D-1, processed with the Visium CytAssist instrument using the Visium Human Transcriptome Probe Set v2.1. 
+
+Sequencing was performed on an Illumina NovaSeq 6000 using a dual index plate (TS set A, sample index H9) with a configuration of 43 bp read 1, 50 bp read 2, and 10 bp i7/i5 sample indexes, producing 444 million reads. Data were processed using Space Ranger v4.0.1 to map FASTQ files, detect tissue, align microscope and CytAssist images, segment cells, and generate feature-barcode matrices for downstream analysis.
+
+```{r}
+datadir <- "data/output_space_ranger_4-0-1/binned_outputs/square_008um"
+object <- Load10X_Spatial(data.dir = datadir, filename = "raw_feature_bc_matrix.h5",filter.matrix = FALSE)
+class(object)
+
+Assays(object)
+DefaultAssay(object) <- "Spatial"
+```
+# Check metadata objects
+
+```{r}
+# Explore metadata
+head(object@meta.data)
+
+# Dimensions
+dim(object)
+
+# View available spatial images
+object@images
+
+```
+
+# Visualize feature counts and 
+
+```{r}
+# Plot the total UMI counts per cell/segment
+# This shows the distribution of how many transcripts (UMIs) were detected in each segmented cell.
+# You'll likely see a large number of segments with low counts (left-skewed), which may be low-quality or background.
+hist(object$nCount_Spatial, breaks = 100, 
+     main = "Total UMIs per cell", 
+     xlab = "nCount_Spatial")
+
+# Plot the number of genes detected per cell/segment
+# Similar to UMI counts, this shows how many genes were detected (non-zero counts) per segment.
+# Again, look for a peak at or near 0–50 genes, which may suggest low-complexity or background segments.
+hist(object$nFeature_Spatial, breaks = 100, 
+     main = "Genes detected per cell", 
+     xlab = "nFeature_Spatial")
+
+# Scatterplot of UMI counts vs. gene counts
+# This reveals the relationship between sequencing depth and gene detection.
+# You’re likely to see a cloud of points: high nCount and high nFeature together indicate high-quality segments,
+# while segments in the lower-left (low nCount and low nFeature) are typically low-quality or empty.
+FeatureScatter(object, feature1 = "nCount_Spatial", feature2 = "nFeature_Spatial")
+
+# Check the quantiles of UMI counts
+# This tells you what the distribution looks like numerically — e.g., what's the 10th, 25th, 50th percentile?
+# It helps you pick a threshold for filtering: do you want to keep the top 75% of cells by count?
+quantile(object$nCount_Spatial, probs = seq(0, 1, 0.1))
+
+# Check the quantiles of gene counts
+# Same logic applies here — it tells you how many genes are typically detected in the lower, middle, and upper percentiles.
+# This helps you justify a filtering threshold like "nFeature > 50".
+quantile(object$nFeature_Spatial, probs = seq(0, 1, 0.1))
+
+df <- object@meta.data
+
+# Testing different thresholds for filtering lowly expressed spots based on UMI and nFeature counts
+ggplot(df, aes(x = nCount_Spatial)) +
+  geom_histogram(bins = 100) +
+  geom_vline(xintercept = 30, color = "red", linetype = "dashed") +
+  ggtitle("UMI counts per segment")
+
+ggplot(df, aes(x = nFeature_Spatial)) +
+  geom_histogram(bins = 100) +
+  geom_vline(xintercept = 40, color = "blue", linetype = "dashed") +
+  ggtitle("Gene counts per segment")
+
+# You can also use packages such as mclust to stablish the optimal thresholds for filtering based on the bimodal gaussian distribution of the data.
+```
+
+# Filtering and replotting
+
+
+```{r}
+object <- subset(object, subset = nCount_Spatial > 30 & nFeature_Spatial > 40)
+
+
+# Replot the histograms and scatterplot after filtering
+hist(object$nCount_Spatial, breaks = 100, 
+     main = "Total UMIs per cell (after filtering)", 
+     xlab = "nCount_Spatial")
+hist(object$nCount_Spatial, breaks = 100, 
+     main = "Total UMIs per cell (after filtering)", 
+     xlab = "nCount_Spatial")
+FeatureScatter(object, feature1 = "nCount_Spatial", feature2 = "nFeature_Spatial")
+
+```
+# Check mitocondria percentage
+
+```{r}
+# Check the percentage of mitochondrial genes
+rownames(object)[grepl("^MT-", rownames(object))]
+# Calculate the percentage of mitochondrial genes per segment
+object[["percent.mt"]] <- PercentageFeatureSet(object, pattern = "^MT-")
+# Plot the percentage of mitochondrial genes
+VlnPlot(object, features = "percent.mt", pt.size = 0.1)
+# Plot on spatial coordinates
+SpatialFeaturePlot(object, features = "percent.mt")
+
+```
+
+Edges of tissue sections (especially exposed to air) often show higher mitochondrial gene percentages because cells there are more likely damaged or dying, mitochondrial RNA is more stable or leaks out, so it accumulates.
+
+# Filter spots with higher mitocondria percentage
+
+```{r}
+# histogram of mitochondrial gene percentage
+hist(object$percent.mt, breaks = 100, 
+     main = "Mitochondrial gene percentage per segment", 
+     xlab = "percent.mt")
+# histogram of mitochondrial gene percentage above 10%
+hist(object$percent.mt[object$percent.mt > 10], breaks = 100, 
+     main = "Mitochondrial gene percentage per segment", 
+     xlab = "percent.mt")
+
+object <- subset(object, subset = percent.mt <= 12.5)
+```
+
+# Check ribosomal genes
+
+```{r}
+# check ribosomal genes
+rownames(object)[grepl("^RPS|^RPL", rownames(object), ignore.case = TRUE)]
+# check and remove spaces from names
+head(gsub(" ", "", rownames(object)))
+rownames(object) <- gsub(" ", "", rownames(object))
+# Calculate the percentage of ribosomal genes per segment
+object[["percent.rb"]] <- PercentageFeatureSet(object, pattern = "^RPS|^RPL")
+VlnPlot(object, features = "percent.rb")
+
+# nothing being detect, we should remove all genes with 0 counts across all spots
+dim(object)
+object <- object[Matrix::rowSums(LayerData(object[["Spatial"]], layer = "counts")) > 0, ]
+dim(object)
+
+```
+
+# Identify cell cycle stage
+
+Although not commonly done in spatial, more common in scRNA-seq, it can still be useful in this scenario where we have proliferating B cells in the lymph node.
+
+```{r}
+# Load cell cycle gene lists
+cc.genes <- Seurat::cc.genes.updated.2019
+
+# Add variables features too for later processing
+object <- FindVariableFeatures(object, nfeatures = 2000)
+
+# Log 2 Normalzation, it is neededs for CellCycleScoring
+object <- NormalizeData(object) 
+
+# Score cell cycle
+object <- CellCycleScoring(object, 
+                           s.features = cc.genes$s.genes, 
+                           g2m.features = cc.genes$g2m.genes, 
+                           set.ident = TRUE)
+
+# Visualize
+VlnPlot(object, features = c("S.Score", "G2M.Score"), pt.size = 0.1)
+table(object$Phase)
+
+# Visualize cell cycle scores on spatial coordinates
+SpatialFeaturePlot(object, features = c("S.Score", "G2M.Score")) +
+  ggtitle("Cell cycle scores")
+
+ggsave(
+  filename = file.path(output_dir, "cell_cycle_scores.png"),
+  width = 10, height = 5, dpi = 300
+)
+
+```
+
+# Visualize spatial immune markers
+
+Just fast visualization of important genes for T cells, GC B cells, Naive and class-switched B cells.
+
+```{r}
+p1 <- SpatialFeaturePlot(object, features = "CD3E") + ggtitle("T cell ")
+p2 <- SpatialFeaturePlot(object, features = "BCL6") + ggtitle("Profiliferating B cell")
+p3 <- SpatialFeaturePlot(object, features = "IGHM") + ggtitle("Naive B cell")
+p4 <- SpatialFeaturePlot(object, features = "IGHG1") + ggtitle("Class-switched B cell")
+p1|p2|p3|p4
+
+# save the plot
+ggsave(
+  filename = file.path(output_dir, "spatial_markers_patch.png"),
+  width = 14, height = 4, dpi = 300
+)
+```
+
+# Save R object
+
+```{r}
+# Save the Seurat object with the QC results
+saveRDS(object, file = file.path(output_dir, "spatial_qc_results.rds"))
+```
+
+# Session info
+
+```{r}
+sessionInfo()
+```
