@@ -1,0 +1,386 @@
+---
+title: "02_normalization_and_clustering"
+format: html
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Setup output folders
+
+```{r}
+#| label: setup-folders
+#| include: false
+
+# Automatically get today's date
+today_date <- format(Sys.Date(), "%Y-%m-%d")
+
+# Create directory path
+output_dir <- file.path("results", "02_normalization_and_clustering_outputs", today_date)
+
+# Create folder if it doesn't exist
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Show where output files will go
+output_dir
+```
+
+# Load packages
+
+```{r}
+#| label: load-packages
+
+if (!requireNamespace("R.utils", quietly = TRUE)) {
+  install.packages("R.utils")
+}
+
+if (!requireNamespace("Banksy", quietly = TRUE)) {
+  if (!requireNamespace("devtools", quietly = TRUE)) install.packages("devtools")
+  devtools::install_github("prabhakarlab/Banksy@devel")
+}
+
+if (!requireNamespace("SeuratWrappers", quietly = TRUE)) {
+  devtools::install_github("satijalab/seurat-wrappers")
+}
+
+if (!requireNamespace("presto", quietly = TRUE)) {
+ devtools::install_github("immunogenomics/presto")
+}
+
+# to install BASS I had to first link .R/Makevars to my gcc compiler
+# BASS was too slow and required too much memory, removed later on
+#devtools::install_github("zhengli09/BASS")
+# library(BASS)
+# Same thing with BayesSpace
+#library(BayesSpace)
+library(Banksy)
+library(SeuratWrappers)
+library(Seurat)
+library(BiocParallel)
+library(ggplot2)
+library(presto)
+
+```
+
+# Load data
+
+Data loaded here is already preprocessed and filtered for quality control, as described in the previous markdown file `01_spatial_qc.qmd`. 
+
+However, already preprocessed data could not be used to `BaysSpace` package normalization/clustering, so below I also load the raw data from `Space Ranger` output.
+
+```{r}
+sce <- readRDS("results/01_qc_outputs/2025-07-22/spatial_qc_results.rds")
+```
+
+# Normalization plus clustering
+
+The Seurat package offers two commonly used normalization methods: `LogNormalize`, which adjusts expression values based on total UMI counts per spot, and SCT, which uses a regression model to normalize for technical noise. However, more advanced spatially aware methods like `BASS`, `BayesSpace`, and `Banksy` have been developed to improve clustering accuracy by incorporating spatial context and all perform normalization as a preprocess step.
+
+In a recent benchmark study ([Yuan et al. Nature Methods, 2024](https://www.nature.com/articles/s41592-024-02215-8)), BayesSpace and BASS were among the top-performing tools for spatial clustering across tissues with varying complexity. However, BASS is computationally intensive and can be prohibitively slow or memory-heavy on large datasets. While BayesSpace is faster, it can still be limiting for high-resolution data such as Visium HD.
+
+For this reason, I decided to test both of those methods but also `Banksy`, a method that performs both normalization and clustering in a spatially informed way. In a separate benchmarking study ([Singhal et al. Nature Genetics, 2024](https://www.nature.com/articles/s41588-024-01664-3)), `Banksy` demonstrated superior performance and scalability on high-resolution spatial transcriptomics data, making it a more practical and robust choice for this analysis.
+
+
+## BayesSpace
+
+ALthough one of the best performances in the benchmark study, `BASS` is too slow and memory heavy for this dataset (code removed), so I decided to test `BayesSpace`. `BayesSpace` is a spatial clustering method that uses a Bayesian hierarchical model to account for spatial dependencies in the data, so in a way it has a very a similar concept to `BASS`. However, although it was not memory heavy, it was extremily slow. Plots were generated and saved only once here for the squares binned at 16um because 8um was impossible to run locally.
+
+```{r}
+#| eval: false
+
+sce <- readVisium("data/output_space_ranger_4-0-1/binned_outputs/square_016um/")
+# For multicore parallelization (Linux/macOS)
+params <- MulticoreParam(workers = 7)
+
+# Run BayesSpace clustering (e.g., k = 7 clusters)
+sce <- spatialPreprocess(sce, platform = "VisiumHD", skip.PCA = FALSE, n.PCs = 15, n.HVGs = 2000, BPPARAM = params, log.normalize = TRUE)
+# Save the preprocessed data
+saveRDS(sce, file = file.path(output_dir, "BayesSpatial_preprocessed.rds"))
+```
+
+
+```{r}
+#| eval: false
+
+# Decide number of clusters
+sce <- qTune(sce, qs=seq(3, 7), platform="VisiumHD", cores=7, burn.in = 10, nrep = 100)
+qPlot(sce)
+
+ggsave(file = file.path(output_dir, "BayesSpatial_qTune.pdf"))
+
+# Define clusters
+set.seed(123)
+sce <- spatialCluster(sce, q = 6, platform = "VisiumHD", d = 10, burn.in = 10, nrep = 1000, model = "t")
+
+clusterPlot(sce, palette=c("#FDAF91FF", "#ED0000FF", "#00468BFF", "#925E9FFF",  "#42B540FF", "#1B1919FF"), color=NULL) + 
+  geom_polygon(size = 0.001)+
+  theme_bw() +
+  xlab("Column") +
+  ylab("Row") +
+  labs(fill="BayesSpace\ncluster", title="Spatial clustering of ST_LYMHPNODE_HUMAN")
+
+ggsave(file = file.path(output_dir, "BayesSpatial_clusterPlot.pdf"))
+```
+
+Clusters were not great compared to the clustering cells just based on markers of naive and class-switched B cells done in the previous markdown.
+
+## Banksy
+
+This method was the fastested that I have tested and it was supposed to be as good as the other too. This chunk is still not run for the sake of time, but it is expected to run in less than 10 minutes on a local machine with 16GB RAM.
+
+```{r}
+#| eval: false
+# the input is the preprocessed dataset where low quality spots were removed, so it is not the raw data
+object <- RunBanksy(sce, verbose = TRUE, lambda = .2,
+  assay = "Spatial", slot = "data", features = "variable",
+  k_geom = 50
+)
+
+# follow guidelines from Seurat vignette for Visium HD
+DefaultAssay(object) <- "BANKSY"
+object <- RunPCA(object, assay = "BANKSY", reduction.name = "pca.banksy", features = rownames(object), npcs = 30)
+object <- FindNeighbors(object, reduction = "pca.banksy", dims = 1:30)
+object <- FindClusters(object, cluster.name = "banksy_cluster", algorithm = 4,random.seed = 123)
+object <- RunUMAP(object, reduction = "pca.banksy", dims = 1:30, reduction.name = "umap.banksy", return.model = T, verbose = T)
+
+
+saveRDS(object, file = file.path(output_dir, "Banksy_processed_clustered.rds"))
+```
+
+### Plots
+
+#### Clusters on tissue
+
+All clusters presented in the plot below are based on the clustering done by `Banksy`, although followed by `Seurat::FindNeighbors` and `Seurat::FindClusters`, the clustering plotted here is based on `Banksy` method.
+
+```{r}
+object <- readRDS(file = "results/02_normalization_and_clustering_outputs/2025-07-28/Banksy_processed_clustered.rds")
+
+Idents(object) <- "banksy_cluster"
+p <- SpatialDimPlot(object, group.by = "banksy_cluster", label = T, repel = T, label.size = 4)
+p
+
+ggsave(file = file.path(output_dir, "Banksy_clusterPlot.pdf"), plot = p, width = 5, height = 5)
+```
+
+#### Highlight spatial location of tissue domains
+
+```{r}
+banksy_cells <- CellsByIdentities(object)
+p <- SpatialDimPlot(object, cells.highlight = banksy_cells[setdiff(names(banksy_cells), "NA")], cols.highlight = c("#FFFF00", "grey50"), facet.highlight = T, combine = T, images = NULL) + NoLegend()
+p
+
+ggsave(file = file.path(output_dir, "Banksy_highlighted_cells.png"), plot = p, width = 10, height = 10, dpi = 300)
+```
+
+You can see clearly some tissue domains, such as the lymphoid follicles, which are enriched in B cells, and the interfollicular regions, which are enriched in T cells. 
+
+#### Clusters on PCA
+```{r}
+p <- DimPlot(object, reduction = "pca.banksy", group.by = "banksy_cluster", label = T, repel = T, label.size = 4, )
+p
+ggsave(file = file.path(output_dir, "Banksy_PCA_plot.pdf"), plot = p, width = 5, height = 5)
+```
+
+#### Clusters on UMAP
+
+```{r}
+p <- DimPlot(object, reduction = "umap.banksy", group.by = "banksy_cluster", label = T, repel = T, label.size = 4)
+p
+ggsave(file = file.path(output_dir, "Banksy_UMAP_plot.pdf"), plot = p, width = 5, height = 5)
+```
+
+# Differential expression
+
+Compare the spatially-informed clusters that  were defined by the above methods (Banksy + Leiden). To speed up the FindAllMarkers function, I will use the `max.cells.per.ident` parameter to downsample each cluster to 1000 cells max. This approach is useful to avoid memory issues and speed up the analysis, especially for large datasets, such as this VisiumHD with 150k spots. In adittion, I have used wilcox test from presto to speed up wilcox calculation. As other parameters, logfc.threshold is set to 0.2, which is higher than the default of 0.1 ,so to test less genes by filtering the ones with higher foldchange. The `min.pct` parameter is set to 0.01, which is the default value. The `return.thresh` parameter is set to 0.05, which will return only statistically significant markers. 
+
+
+```{r}
+#| eval: false
+markers <- FindAllMarkers(
+  object,
+  test.use = "wilcox",
+  only.pos = TRUE,
+  min.pct = 0.01,         # default, can increase to 0.3 or 0.4 to reduce number of genes tested
+  logfc.threshold = 0.2, # default, can increase to 0.5 for stricter filtering
+  max.cells.per.ident = 1000, # downsample each cluster to 1000 cells max
+  random.seed = 123,
+  return.thresh = 0.05    # returns only statistically significant markers
+)
+
+saveRDS(markers, file = file.path(output_dir, "Banksy_markers.rds"))
+
+```
+
+```{r}
+markers <- readRDS(file = file.path(output_dir, "Banksy_markers.rds"))
+
+top10 <- markers %>%
+  dplyr::group_by(cluster) %>%
+  dplyr::filter(p_val_adj < 0.05) %>%
+  dplyr::slice_max(order_by = avg_log2FC, n = 10)
+
+write.table(table(top10$gene, top10$cluster),           
+            file = file.path(output_dir, "Banksy_top10_markers.txt"),
+            sep = "\t", quote = FALSE, col.names = NA) 
+
+```
+
+## Plot heatmap
+
+```{r}
+
+# Clean gene names and keep only those present
+genes <- intersect(gsub("\\.m0$", "", top10$gene), rownames(object[["Spatial"]]))
+
+# Subset the object by genes only
+sub <- subset(object, features = genes)
+
+# Scale and plot
+# Example: Plotting a heatmap of the top 20% of cells in each cluster
+max_cells <- min(table(Idents(object))) # Get the smallest cluster size
+cells_to_plot <- unlist(lapply(levels(Idents(object)), function(cluster) {
+  cluster_cells <- WhichCells(object, idents = cluster)
+  downsampled_cells <- sample(cluster_cells, size = max_cells * 0.2) # 20% of cells
+  return(downsampled_cells)
+}))
+
+sub <- ScaleData(sub, features = genes)
+
+DoHeatmap(sub, features = genes, cells = cells_to_plot) + NoLegend()
+
+ggsave(file = file.path(output_dir, "Banksy_heatmap.pdf"), width = 10, height = 10)
+```
+
+
+## Plot key markers for cell types
+
+```{r}
+# 1) Defined marker set based on DEGs found for each group and also by the literature.
+marker.genes <- c(
+  # GC B cells
+  "RGS13", "SERPINA9", "FCAMR", "CLU", "CD19",
+  # Blood vascular EC
+  "VWF", "AQP1", "ACKR1", "SPARCL1", "SYT15",
+  # Lymphatic EC
+  "PROX1", "ARHGAP22",
+  # FRCs
+  "CEMIP", "CCL19",
+  # pDCs
+  "CLEC4C", "LILRA4", "IRF7",
+  # Smooth‐muscle/pericytes
+  "ACTA2", "CNN1", "TAGLN",
+  # T‐zone reticular
+  "CCL17", "CCL21", "CD3E", "CD3D", "CD4", "CD8A", "FOXP3", "TRAC",
+  # Macrophages
+  "C1QA", "C1QB", "C1QC", "MARCO", "CPVL",
+  # Plasma cells
+  "IGHG1", "IGHG3", "JCHAIN", "IGHA2", "IGHM", "PIM2","CD69", "CXCR4", "IGKC", "IGLC2", "IGLC3",
+  # AID+ activated B
+  "AICDA"
+)
+
+# 2) A compact dot‐plot across all clusters:
+DotPlot(object, features = marker.genes) + 
+  RotatedAxis()
+
+ggsave(file = file.path(output_dir, "Banksy_clusters_dotplot.pdf"), width = 10, height = 5)
+
+```
+
+```{r}
+# 3) UMAP‐based feature plots (panels of 6 per row):
+FeaturePlot(
+  object, 
+  features = marker.genes, 
+  reduction = "umap.banksy", 
+  ncol = 6
+)
+
+ggsave(file = file.path(output_dir, "umap_Banksy_clusters_featureplot.pdf"), width = 15, height = 15)
+```
+
+
+## Replot UMAP based on defined clusters nomenclature
+
+```{r}
+cluster.labels <- c(
+  "1"  = "Activated B cell",
+  "2"  = "Blood vascular EC",
+  "3"  = "Lymphatic EC",
+  "4"  = "FRC",
+  "5"  = "B cell",               # ambiguous or transitional
+  "6"  = "B cell",               # ambiguous
+  "7"  = "Naïve B cell",
+  "8"  = "pDC",
+  "9"  = "Activated B cell",            # same identity as 1
+  "10" = "T cell",
+  "11" = "T cell",
+  "12" = "T cell",
+  "13" = "T cell",
+  "14" = "Plasma cell",
+  "15" = "Pericyte / SMC",
+  "16" = "T-zone reticular",
+  "17" = "B cell",
+  "18" = "Macrophage",
+  "19" = "Plasma cell",
+  "20" = "T cell",
+  "21" = "B cell",
+  "22" = "B cell",
+  "23" = "Activated B cell"  # AICDA+ and CD38+ (active GC B)
+)
+object@meta.data$celltype <- cluster.labels[as.character(Idents(object))]
+
+p <- DimPlot(
+  object,
+  reduction = "umap.banksy",
+  group.by = "celltype",
+  label = TRUE,
+  repel = TRUE,
+  label.size = 4
+)
+p
+
+ggsave(
+  filename = file.path(output_dir, "Banksy_UMAP_celltypes.pdf"),
+  plot = p, width = 5, height = 5
+)
+
+
+```
+
+This annotation is quite rough, deconvolution using a scRNA-seq dataset would probably improve this annotation and increase confidence on what I have names as "B cell" or "T cell", for example. However, it is a good starting point to understand the tissue architecture and the spatial distribution of the different cell types in the lymph node.
+
+## Replot on the spatial tissue
+
+```{r}
+p <- SpatialDimPlot(
+  object,
+  group.by = "celltype",
+  label = TRUE,
+  repel = TRUE,
+  label.size = 2
+) +
+  theme_void() +
+  scale_fill_brewer(palette = "Paired") 
+p
+
+ggsave(
+  filename = file.path(output_dir, "Banksy_spatial_celltypes.pdf"),
+  plot = p, width = 5, height = 5
+)
+```
+# Save the annotated object
+
+```{r}
+saveRDS(object, file = file.path(output_dir, "Banksy_manually_annotated_object.rds"))
+```
+
+# SessionInfo
+
+```{r}
+SessionInfo()
+```
