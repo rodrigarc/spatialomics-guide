@@ -1,0 +1,147 @@
+---
+title: "04_cell_communication"
+format: html
+---
+
+
+## Setup output folders
+
+```{r}
+#| label: setup-folders
+#| include: false
+
+# Automatically get today's date
+today_date <- format(Sys.Date(), "%Y-%m-%d")
+
+# Create directory path
+output_dir <- file.path("results", "04_cell_comunication_outputs", today_date)
+
+# Create folder if it doesn't exist
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+# Show where output files will go
+output_dir
+```
+
+# Load packages
+
+```{r}
+#| label: load-packages
+#| include: false
+#| warning: false
+#| message: false
+#| error: false
+
+library(CellChat)
+library(Seurat)
+library(dplyr)
+library(ggplot2)
+```
+
+Perform cell chat communication analysis on the Banksy dataset using the cell type annotations and deconvolution results obtained from the previous step. This analysis will help us understand the cell-cell communication patterns in the spatial transcriptomics data.
+
+# Load Data
+
+Load data preprocessed with `03_cell_type_deconvolution.qmd` script. This data contains the cell type annotations for each spot in the Banksy dataset and deconvolution using scRNAseq from lymph node and PBMC from humans.
+
+```{r}
+object <- readRDS(file ="results/03_cell_type_deconvolution_outputs/2025-07-30/Banksy_merged_annotation.rds")
+```
+
+# Extract data to CellChat format
+
+
+```{r}
+
+# keep only high confidence deconvoluted spots
+
+# Subset to keep only first_type and remove rejects/NA
+object_subset <- subset(object, subset = !(spot_class %in% c("reject")) & !is.na(spot_class))
+
+
+# Extract normalized data and metadata
+data.input <- GetAssayData(object_subset, assay = "BANKSY", slot = "data")
+coords <- GetTissueCoordinates(object_subset)
+meta <- data.frame(first_type = object_subset$first_type)
+rownames(meta) <- colnames(object_subset)
+meta$first_type <- droplevels(as.factor(meta$first_type))
+coords <- coords[colnames(data.input), ]  # Ensure same order
+coords <- as.matrix(coords)
+coords <- coords[,c(1,2)]
+
+spatial.factors <- data.frame(
+  ratio = 0.3,  # controls decay steepness (tune if needed)
+  tol = 30      # ~15 µm in pixels, neighborhood radius for interactions
+)
+
+# Create CellChat object
+DefaultAssay(object_subset) <- "BANKSY"
+cellchat <- createCellChat(object = data.input,
+                           meta = meta,
+                           group.by = "first_type",
+                           datatype = "spatial",
+                           coordinates = coords,
+                           spatial.factors = spatial.factors)
+
+# Set the ligand-receptor database
+CellChatDB <- CellChatDB.human 
+cellchat@DB <- CellChatDB
+
+```
+
+# Preprocess data
+
+```{r}
+cellchat <- subsetData(cellchat)                        
+cellchat <- identifyOverExpressedGenes(cellchat)
+cellchat <- identifyOverExpressedInteractions(cellchat)
+cellchat <- computeCommunProb(cellchat, raw.use = TRUE)
+cellchat <- filterCommunication(cellchat, min.cells = 1)
+cellchat <- computeCommunProbPathway(cellchat)
+cellchat <- aggregateNet(cellchat)
+
+```
+```{r}
+saveRDS(cellchat, file = file.path(output_dir, "cellchat_object.rds"))
+```
+
+
+# Save CellChat object
+
+Save computed cell chat to avoid rerunninng
+
+```{r}
+saveRDS(cellchat, file = file.path(output_dir, "cellchat_object.rds"))
+```
+
+# Visualize calculated communication probabilities
+
+## Visualize communication network
+
+```{r}
+groupSize <- as.numeric(table(cellchat@idents))
+
+netVisual_circle(cellchat@net$count, vertex.weight = groupSize, 
+                 weight.scale = TRUE, label.edge = FALSE,
+                 title.name = "Number of interactions")
+
+netVisual_circle(cellchat@net$weight, vertex.weight = groupSize, 
+                 weight.scale = TRUE, label.edge = FALSE,
+                 title.name = "Interaction strength")
+
+```
+
+## Visualize individual pathway (e.g., MIF)
+
+```{r}
+netVisual_aggregate(cellchat, signaling = "MIF", layout = "circle")
+```
+
+
+# Session Info
+```{r}
+sessionInfo()
+```
+
