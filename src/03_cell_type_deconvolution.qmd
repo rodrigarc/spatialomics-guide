@@ -71,7 +71,7 @@ searchDatasets(
 searchDatasets(
   defineTextQuery("organs", partial = TRUE)
 )
-
+3
 sce_lymphnode <- fetchDataset("he-organs-2020", version = "2023-12-21", path = "lymph_node")
 sce_blood <- fetchDataset("he-organs-2020", version = "2023-12-21", path = "blood")
 
@@ -80,6 +80,9 @@ HDF5Array::saveHDF5SummarizedExperiment(sce_blood, dir = "data/reference_dataset
 ```
 
 ```{r}
+sce_lymphnode <- fetchDataset("he-organs-2020", version = "2023-12-21", path = "lymph_node")
+sce_blood <- fetchDataset("he-organs-2020", version = "2023-12-21", path = "blood")
+
 sce_lymphnode
 sce_blood
 
