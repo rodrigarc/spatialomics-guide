@@ -79,6 +79,7 @@ library(scRNAseq)     # Reference datasets
 # Supporting packages
 library(tidyverse)    # Data wrangling
 library(arrow)        # Efficient data storage
+```
 
 ## Usage
 
